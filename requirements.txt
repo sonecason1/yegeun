@@ -1,0 +1,4 @@
+finance-datareader
+tradingview-screener
+pandas
+numpy

@@ -1,0 +1,34 @@
+name: daily-screener
+
+on:
+  schedule:
+    - cron: "40 7 * * 1-5"   # 평일 16:40 KST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: screener
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 스크리너 실행
+        run: python screener/run_tv.py
+      - name: 결과 저장(커밋)
+        run: |
+          git config user.name  "screener-bot"
+          git config user.email "screener-bot@users.noreply.github.com"
+          git add docs/data
+          git diff --cached --quiet || git commit -m "스크리닝 결과 $(TZ=Asia/Seoul date +%F)"
+          git push

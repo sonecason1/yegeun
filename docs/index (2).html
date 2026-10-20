@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>미너비니 VCP 스크리너</title>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+:root{--bg:#0f1419;--card:#182029;--line:#2a3542;--fg:#e6e9ee;--mut:#8b96a5;--up:#e5484d;--dn:#3e8ef7;--ok:#30a46c;--warn:#f5a524}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,"Malgun Gothic","Apple SD Gothic Neo",sans-serif}
+header{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between}
+h1{font-size:18px;margin:0}.mut{color:var(--mut)}main{padding:16px 20px;max-width:1400px;margin:auto}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}.card b{font-size:20px}
+.tabs button,select,a.btn{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer;font:inherit;text-decoration:none}
+.tabs button.on{background:#2b5fd9;border-color:#2b5fd9}
+.wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;width:100%;white-space:nowrap}th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:right}
+th{background:#1d2732;position:sticky;top:0;cursor:pointer;font-weight:600}td:nth-child(-n+2),th:nth-child(-n+2){text-align:left}
+tr:hover td{background:#1c2631}tr.sel td{background:#22314a}
+.g{display:inline-block;width:22px;text-align:center;border-radius:4px;font-weight:700;color:#000}.gA{background:#6ee7a0}.gB{background:#8ab8ff}.gC{background:#ffd76a}.gN{background:#555;color:#ddd}
+.st{font-size:12px;padding:2px 6px;border-radius:4px;background:#2a3542}.st.hot{background:#5b2328;color:#ffb4b8}.st.near{background:#1f3d2c;color:#8ff0b5}.st.warn{background:#4a3a12;color:#ffd58a}
+tr.sub td{border-top:none}
+#panel{margin-top:16px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;display:none}
+#chart{height:430px}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;margin-bottom:8px}
+.calc input{width:110px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 6px}
+footer{padding:20px;color:var(--mut);font-size:12px;text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <div><h1>미너비니 VCP 스크리너</h1><div class="mut" id="meta">불러오는 중…</div></div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <select id="hist"></select>
+    <a class="btn" id="wl" href="data/watchlist_tradingview.txt" download>TradingView 관심목록 받기</a>
+    <a class="btn" href="data/models_latest.csv" download>진입모델 CSV(엑셀)</a>
+  </div>
+</header>
+<main>
+  <div class="cards" id="cards"></div>
+  <div class="row">
+    <div class="tabs"><button data-t="models" class="on">진입모델 (5종)</button> <button data-t="vcp">VCP 후보 (기존)</button> <button data-t="all">트렌드 템플릿 전체</button>
+      <span id="mf"> <select id="fst"><option value="">상태 전체</option><option>진입 신호 확인</option><option>패턴 형성 중</option><option>주의/무효화</option><option>데이터 부족</option></select>
+      <select id="fmd"><option value="">모델 전체</option><option value="vcp">VCP</option><option value="cup">컵 위드 핸들</option><option value="c3">3C</option><option value="flat">플랫 베이스</option><option value="power">파워 플레이</option></select></span></div>
+    <div class="calc mut">계좌 <input id="acct" type="number" value="10000000"> 원 · 1회 리스크 <input id="risk" type="number" value="1" step="0.25" style="width:60px"> %</div>
+  </div>
+  <div class="wrap"><table><thead id="th"></thead><tbody id="tb"></tbody></table></div>
+  <div id="panel">
+    <div class="row"><div id="ptitle"></div><a class="btn" id="tvlink" target="_blank">TradingView에서 열기 ↗</a></div>
+    <div id="chart"></div>
+    <div class="mut" id="pinfo" style="margin-top:8px"></div>
+  </div>
+</main>
+<footer>장 마감 후 자동 갱신 · 진입모델 점수·임계값은 검증되지 않은 초기값(screener/config.json) · 데이터: TradingView 스크리너, FinanceDataReader · 기계적 필터링 결과이며 매수 추천이 아닙니다.</footer>
+<script>
+const $=s=>document.querySelector(s);let D=null,tab="models",sortK=null,sortAsc=false,chart=null;
+const MST={"진입 신호 확인":"hot","패턴 형성 중":"near","주의/무효화":"warn"};
+const CN={trend:"추세",pattern:"패턴",contraction:"수축",volume:"거래량",atr:"ATR",rsi:"RSI",rs:"상대강도",pivot:"피벗",liquidity:"유동성"};
+const MCOLS=["종목","모델","상태","점수","현재가","피벗","피벗 대비","무효화","RSI","ATR/종가","거래량 5/20","지수대비 3M","주요 사유"];
+const pct=v=>v==null?"-":(v*100).toFixed(1)+"%",p1=v=>v==null?"-":v.toFixed(1)+"%",won=v=>v==null?"-":Math.round(v).toLocaleString();
+const COLS=[["name","종목"],["status","상태"],["grade","실적"],["rs","RS"],["close","종가"],["pivot","피벗"],["pivot_dist","피벗까지"],["stop","손절가"],["stop_pct","손절폭"],["qty","수량(1R)"],["contractions","수축"],["eps_yoy","EPS YoY"],["rev_yoy","매출 YoY"],["from_high","고점대비"],["turnover_eok","거래대금(억)"],["sector","업종"],["next_earnings","다음 실적"]];
+function qty(s){const a=+$("#acct").value,r=+$("#risk").value/100;if(!s.pivot||!s.stop||s.pivot<=s.stop)return null;return Math.floor(a*r/(s.pivot-s.stop))}
+function cell(s,k){const v=s[k];switch(k){
+ case"name":return`<b>${s.name}</b> <span class="mut">${s.code}</span>`;
+ case"status":return`<span class="st ${v.startsWith("돌파(")?"hot":v.startsWith("돌파 임박")?"near":""}">${v}</span>`;
+ case"grade":return`<span class="g g${v==="N/A"?"N":v}">${v==="N/A"?"-":v}</span>`;
+ case"close":case"pivot":case"stop":return won(v);
+ case"pivot_dist":case"stop_pct":case"from_high":return pct(v);
+ case"eps_yoy":case"rev_yoy":return p1(v);
+ case"qty":{const q=qty(s);return q==null?"-":`${q.toLocaleString()}주<br><span class="mut">${won(q*s.pivot)}원</span>`}
+ default:return v??"-"}}
+function render(){
+ if(tab==="models"){renderModels();return}
+ $("#mf").style.display="none";
+ let rows=D.stocks.filter(s=>tab==="all"||s.vcp);
+ if(sortK)rows=[...rows].sort((a,b)=>{const x=sortK==="qty"?qty(a):a[sortK],y=sortK==="qty"?qty(b):b[sortK];return (x>y?1:x<y?-1:0)*(sortAsc?1:-1)});
+ $("#th").innerHTML="<tr>"+COLS.map(([k,l])=>`<th data-k="${k}">${l}${sortK===k?(sortAsc?" ▲":" ▼"):""}</th>`).join("")+"</tr>";
+ $("#tb").innerHTML=rows.length?rows.map(s=>`<tr data-c="${s.code}">`+COLS.map(([k])=>`<td>${cell(s,k)}</td>`).join("")+"</tr>").join(""):`<tr><td colspan="${COLS.length}" class="mut" style="text-align:center;padding:30px">해당 종목 없음 — 시장이 약할 땐 쉬는 것도 전략입니다</td></tr>`;
+ document.querySelectorAll("th").forEach(th=>th.onclick=()=>{const k=th.dataset.k;sortAsc=sortK===k?!sortAsc:false;sortK=k;render()});
+ document.querySelectorAll("#tb tr[data-c]").forEach(tr=>tr.onclick=()=>show(tr.dataset.c));
+}
+async function show(code){
+ const s=D.stocks.find(x=>x.code===code);document.querySelectorAll("#tb tr").forEach(t=>t.classList.toggle("sel",t.dataset.c===code));
+ $("#panel").style.display="block";$("#ptitle").innerHTML=`<b>${s.name}</b> <span class="mut">${s.code} · ${s.industry||""}</span>`;
+ $("#tvlink").href=`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(s.tv)}`;
+ $("#pinfo").innerHTML=`상태: ${s.status} · 수축 ${s.contractions||"-"} · 베이스 ${s.base_days??"-"}일 · 거래량 수축비 ${s.vol_dry??"-"} · 200일선 상승 ${s.ma200_up_days}일 · 영업이익률 ${p1(s.op_margin)}${s.note?" · ⚠ "+s.note:""}`;
+ let bars;try{bars=await (await fetch(`data/charts/${code}.json`)).json()}catch(e){$("#chart").innerHTML='<p class="mut">차트 데이터 없음 (지난 기록에서는 차트가 보관되지 않습니다)</p>';return}
+ $("#chart").innerHTML="";chart=LightweightCharts.createChart($("#chart"),{layout:{background:{color:"#182029"},textColor:"#c9d1d9"},grid:{vertLines:{color:"#222c37"},horzLines:{color:"#222c37"}},rightPriceScale:{borderColor:"#2a3542"},timeScale:{borderColor:"#2a3542"},autoSize:true});
+ const c=chart.addCandlestickSeries({upColor:"#e5484d",downColor:"#3e8ef7",borderVisible:false,wickUpColor:"#e5484d",wickDownColor:"#3e8ef7"});
+ c.setData(bars.map(b=>({time:b[0],open:b[1],high:b[2],low:b[3],close:b[4]})));
+ [[6,"#f5a524","50일"],[7,"#58a6ff","150일"],[8,"#ff6b6b","200일"]].forEach(([i,col,t])=>{const l=chart.addLineSeries({color:col,lineWidth:1,priceLineVisible:false,lastValueVisible:false,title:t});l.setData(bars.filter(b=>b[i]!=null).map(b=>({time:b[0],value:b[i]})))});
+ const v=chart.addHistogramSeries({priceScaleId:"v",priceFormat:{type:"volume"}});chart.priceScale("v").applyOptions({scaleMargins:{top:.8,bottom:0}});
+ v.setData(bars.map(b=>({time:b[0],value:b[5],color:b[4]>=b[1]?"#e5484d66":"#3e8ef766"})));
+ if(s.pivot)c.createPriceLine({price:s.pivot,color:"#30a46c",lineStyle:2,title:"피벗"});
+ if(s.stop)c.createPriceLine({price:s.stop,color:"#e5484d",lineStyle:1,title:"손절"});
+ chart.timeScale().setVisibleLogicalRange({from:bars.length-160,to:bars.length+5});
+ $("#panel").scrollIntoView({behavior:"smooth"});
+}
+function renderModels(){
+ $("#mf").style.display="";
+ const fs=$("#fst").value,fm=$("#fmd").value;let html="",n=0;
+ (D.models||[]).forEach(s=>{
+  s.models.filter(e=>(!fs||e.status===fs)&&(!fm||e.model===fm)).forEach((e,i)=>{n++;
+   const why=[...(e.plus||[]).slice(0,2).map(x=>"✓ "+x),...(e.minus||[]).slice(0,2).map(x=>"- "+x)].join("<br>");
+   html+=`<tr data-c="${s.code}" data-m="${e.model}" class="${i?"sub":""}"><td>${i?"":`<b>${s.name}</b> <span class="mut">${s.code}</span>`}</td><td>${e.model_name}</td>`+
+    `<td><span class="st ${MST[e.status]||""}">${e.status}</span><br><span class="mut" style="font-size:11px">${(e.detail||"").split(" | ")[0]}</span></td>`+
+    `<td>${e.score??"-"}</td><td>${won(s.close)}</td><td>${won(e.pivot)}</td><td>${pct(e.dist)}</td><td>${won(e.invalid)}</td><td>${s.rsi??"-"}</td>`+
+    `<td>${pct(s.atrp)} <span class="mut">${s.atrp_dir||""}</span></td><td>${s.vol_dry??"-"}</td>`+
+    `<td>${s.rs_excess==null?`<span class="mut">${s.rs_na||"-"}</span>`:pct(s.rs_excess)}</td><td style="text-align:left;white-space:normal;min-width:260px;font-size:12px">${why}</td></tr>`})});
+ $("#th").innerHTML="<tr>"+MCOLS.map(c=>`<th>${c}</th>`).join("")+"</tr>";
+ $("#tb").innerHTML=n?html:`<tr><td colspan="${MCOLS.length}" class="mut" style="text-align:center;padding:30px">${D.models?"조건에 맞는 종목 없음":"이 날짜 기록에는 진입모델 결과가 없습니다"}</td></tr>`;
+ document.querySelectorAll("#tb tr[data-m]").forEach(tr=>tr.onclick=()=>showModel(tr.dataset.c,tr.dataset.m));
+}
+async function showModel(code,mk){
+ const s=D.models.find(x=>x.code===code),e=s.models.find(x=>x.model===mk);
+ document.querySelectorAll("#tb tr").forEach(t=>t.classList.toggle("sel",t.dataset.c===code&&t.dataset.m===mk));
+ $("#panel").style.display="block";
+ $("#ptitle").innerHTML=`<b>${s.name}</b> <span class="mut">${s.code} · ${e.model_name} · 점수 ${e.score??"-"} (원점수 ${e.score_raw??"-"} / 만점 ${e.score_max??"-"})</span>`;
+ $("#tvlink").href=`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(s.tv)}`;
+ const comp=Object.entries(e.components||{}).map(([k,v])=>`${CN[k]||k} ${v==null?"계산불가":(v*100).toFixed(0)}`).join(" · ");
+ $("#pinfo").innerHTML=`<b>${e.status}</b> — ${e.detail}<br>무효화 조건: ${e.invalid_rule||"-"}<br>항목 점수(0~100): ${comp}`+
+  `<br>이평선 21일 기울기: 50일 ${pct(s.ma50_slope)} · 150일 ${pct(s.ma150_slope)} · 200일 ${pct(s.ma200_slope)} · 데이터 기준일 ${s.asof}`+
+  `<br><span style="color:#8ff0b5">${(e.plus||[]).join(" / ")}</span><br><span style="color:#ffb4b8">${(e.minus||[]).join(" / ")}</span>`;
+ await drawChart(code,[[e.pivot,"#30a46c",2,"피벗"],[e.invalid,"#e5484d",1,"무효화"]]);
+}
+async function drawChart(code,lines){
+ let bars;try{bars=await (await fetch(`data/charts/${code}.json`)).json()}catch(err){$("#chart").innerHTML='<p class="mut">차트 데이터 없음 (주의/무효화 종목과 지난 기록은 차트를 저장하지 않습니다)</p>';return}
+ if(chart){chart.remove();chart=null}
+ $("#chart").innerHTML="";chart=LightweightCharts.createChart($("#chart"),{layout:{background:{color:"#182029"},textColor:"#c9d1d9"},grid:{vertLines:{color:"#222c37"},horzLines:{color:"#222c37"}},rightPriceScale:{borderColor:"#2a3542"},timeScale:{borderColor:"#2a3542"},autoSize:true});
+ const c=chart.addCandlestickSeries({upColor:"#e5484d",downColor:"#3e8ef7",borderVisible:false,wickUpColor:"#e5484d",wickDownColor:"#3e8ef7"});
+ c.setData(bars.map(b=>({time:b[0],open:b[1],high:b[2],low:b[3],close:b[4]})));
+ [[6,"#f5a524","50일"],[7,"#58a6ff","150일"],[8,"#ff6b6b","200일"]].forEach(([i,col,t])=>{const l=chart.addLineSeries({color:col,lineWidth:1,priceLineVisible:false,lastValueVisible:false,title:t});l.setData(bars.filter(b=>b[i]!=null).map(b=>({time:b[0],value:b[i]})))});
+ const v=chart.addHistogramSeries({priceScaleId:"v",priceFormat:{type:"volume"}});chart.priceScale("v").applyOptions({scaleMargins:{top:.8,bottom:0}});
+ v.setData(bars.map(b=>({time:b[0],value:b[5],color:b[4]>=b[1]?"#e5484d66":"#3e8ef766"})));
+ lines.forEach(([p,col,ls,t])=>{if(p)c.createPriceLine({price:p,color:col,lineStyle:ls,title:t})});
+ chart.timeScale().setVisibleLogicalRange({from:bars.length-160,to:bars.length+5});
+ $("#panel").scrollIntoView({behavior:"smooth"});
+}
+function addModelCards(){
+ if(!D.model_counts)return;const c=st=>D.model_counts.filter(x=>x.status===st).reduce((a,x)=>a+x.n,0);
+ $("#cards").innerHTML+=`<div class="card"><div class="mut">진입 신호 (모델 기준)</div><b style="color:var(--up)">${c("진입 신호 확인")}</b></div>`+
+  `<div class="card"><div class="mut">패턴 형성 중</div><b style="color:var(--ok)">${c("패턴 형성 중")}</b></div>`+
+  `<div class="card"><div class="mut">진입모델 사전 필터 통과</div><b>${(D.counts.prefilter??"-").toLocaleString()}</b></div>`;
+}
+async function load(file){
+ D=await (await fetch(file+"?t="+Date.now())).json();
+ $("#meta").textContent=`기준일 ${D.asof} · 생성 ${D.generated_at}`;
+ const m=D.market.map(x=>`<div class="card"><div class="mut">${x.name}</div><b style="color:${x.state==="상승 추세"?"var(--ok)":x.state==="하락 추세"?"var(--up)":"var(--warn)"}">${x.state}</b><div class="mut">고점대비 ${pct(x.from_high)}</div></div>`).join("");
+ $("#cards").innerHTML=m+`<div class="card"><div class="mut">분석 종목</div><b>${D.counts.universe.toLocaleString()}</b></div><div class="card"><div class="mut">트렌드 템플릿</div><b>${D.counts.trend}</b></div><div class="card"><div class="mut">VCP 후보</div><b>${D.counts.vcp}</b></div>`;
+ addModelCards();$("#panel").style.display="none";render();
+}
+(async()=>{
+ try{const idx=await (await fetch("data/history/index.json?t="+Date.now())).json();
+  $("#hist").innerHTML=`<option value="data/latest.json">최신</option>`+idx.slice().reverse().map(d=>`<option value="data/history/${d}.json">${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6)}</option>`).join("")}catch(e){$("#hist").innerHTML=`<option value="data/latest.json">최신</option>`}
+ $("#hist").onchange=e=>load(e.target.value);
+ document.querySelectorAll(".tabs button").forEach(b=>b.onclick=()=>{tab=b.dataset.t;document.querySelectorAll(".tabs button").forEach(x=>x.classList.toggle("on",x===b));render()});
+ ["#acct","#risk"].forEach(i=>$(i).oninput=render);
+ ["#fst","#fmd"].forEach(i=>$(i).onchange=render);
+ load("data/latest.json");
+})();
+</script>
+</body>
+</html>

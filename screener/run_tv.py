@@ -24,18 +24,35 @@ import FinanceDataReader as fdr
 from tradingview_screener import Query, col
 
 sys.path.insert(0, os.path.dirname(__file__))
-from vcp import CFG, detect_vcp  # noqa: E402
+from vcp import CFG, detect_vcp  # noqa: E402  (기존 VCP 스크리너 - 호환용으로 그대로 유지)
+import models as MD  # noqa: E402  (5대 진입모델)
+
+MCFG = MD.load_config()
+
+
+def _jsonable(o):
+    """numpy 값(bool·int·float)을 JSON 저장 가능한 Python 값으로 변환"""
+    if isinstance(o, np.bool_):
+        return bool(o)
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return None if not np.isfinite(o) else float(o)
+    if isinstance(o, (pd.Timestamp, datetime)):
+        return o.strftime("%Y-%m-%d")
+    raise TypeError(f"JSON 변환 불가: {type(o)}")
 
 KST = timezone(timedelta(hours=9))
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "docs", "data")
 
+# 기존 설정값도 config.json에서 읽는다 (값은 기존과 동일)
 SETTINGS = dict(
-    min_marcap=500e8,      # 시가총액 500억 이상
-    min_turnover=30e8,     # 30일 평균 거래대금 30억 이상
-    rs_min=70,             # RS 70 이상
-    chart_bars=260,        # 차트에 저장할 일봉 수 (약 1년)
-    keep_history=60,       # 날짜별 기록 보관 개수
+    min_marcap=MCFG["universe"]["min_marcap"],        # 시가총액 500억 이상
+    min_turnover=MCFG["universe"]["min_turnover"],    # 평균 거래대금 30억 이상
+    rs_min=MCFG["legacy"]["rs_min"],                  # RS 70 이상
+    chart_bars=MCFG["output"]["chart_bars"],          # 차트에 저장할 일봉 수
+    keep_history=MCFG["output"]["keep_history"],      # 날짜별 기록 보관 개수
 )
 
 TV_FIELDS = [
@@ -113,11 +130,11 @@ def fund_grade(eps, rev):
 
 # ───────────────────────── 2단계: 일봉 이력 ─────────────────────────
 def fetch_hist(code, start):
+    """거래량 0(거래정지)일도 그대로 반환 → 진입모델에서 횟수를 기록. 기존 VCP 경로는 호출부에서 0을 제거"""
     for attempt in range(3):
         try:
             d = fdr.DataReader(code, start)
-            d = d[["Open", "High", "Low", "Close", "Volume"]].dropna()
-            return code, d[d["Volume"] > 0]
+            return code, d[["Open", "High", "Low", "Close", "Volume"]].dropna()
         except Exception:
             time.sleep(1 + attempt)
     return code, None
@@ -168,23 +185,113 @@ def num(v, nd=4):
     return v
 
 
+# ───────────────────────── 진입모델용 넓은 사전 필터 ─────────────────────────
+def model_prefilter(tv):
+    """엄격한 트렌드 템플릿 대신 '명백히 아닌 종목'만 거른다. 사유별 탈락 수를 기록"""
+    p = MCFG["prefilter"]
+    c, ma200, hi52 = tv["close"], tv["SMA200"], tv["price_52_week_high"]
+    liq = tv["turnover"] >= MCFG["universe"]["min_turnover"]
+    power = tv["Perf.3M"].fillna(0) >= p["power_perf3m_min"]
+    near200 = ma200.isna() | (c >= ma200 * p["min_close_to_ma200"])
+    near_hi = hi52.isna() | (c >= hi52 * p["min_from_52w_high"])
+    keep = liq & ((near200 & near_hi) | power)
+    drop = {
+        "유동성 미달 (거래대금)": int((~liq).sum()),
+        f"200일선 대비 {p['min_close_to_ma200']:.0%} 미만 (장기 하락)": int((liq & ~power & ~near200).sum()),
+        f"52주 고점 대비 {p['min_from_52w_high']:.0%} 미만": int((liq & ~power & near200 & ~near_hi).sum()),
+    }
+    return keep, drop
+
+
+def fetch_benchmarks(start):
+    rc = MCFG["relative_strength"]
+    out = {}
+    for mk, sym in [("KOSPI", rc["benchmark_kospi"]), ("KOSDAQ", rc["benchmark_kosdaq"])]:
+        try:
+            out[mk] = fdr.DataReader(sym, start)["Close"].dropna()
+        except Exception as e:
+            print("벤치마크 조회 실패:", sym, e)
+    try:
+        lst = fdr.StockListing("KRX")
+        mkt = dict(zip(lst["Code"], lst["Market"].replace("KOSDAQ GLOBAL", "KOSDAQ")))
+    except Exception as e:
+        print("시장 구분 조회 실패 (코스피 ETF로 통일):", e)
+        mkt = {}
+    return out, mkt
+
+
+def model_rows(tv_rows, hist, bench, mkt):
+    stocks, rej = [], {}
+    for _, r in tv_rows.iterrows():
+        d = hist.get(r["code"])
+        meta = dict(code=r["code"], name=r["description"], tv=f"KRX:{r['code']}", sector=r["sector"],
+                    market=mkt.get(r["code"], "KOSPI"), rs_pct=int(r["RS"]),
+                    grade=fund_grade(r["earnings_per_share_diluted_yoy_growth_fq"], r["total_revenue_yoy_growth_fq"]))
+        if d is None or len(d) == 0:
+            meta.update(models=[dict(model="data", model_name="전체 모델", status=MD.NODATA, detail="일봉 조회 실패",
+                                     score=None, plus=[], minus=[], warnings=[], info={})], rejections={})
+            stocks.append(meta)
+            continue
+        mk = meta["market"]
+        b = bench.get(mk) if mk in bench else bench.get("KOSPI")
+        try:
+            res = MD.analyze_stock(d, b, MCFG, meta=meta)
+        except Exception as e:                       # 한 종목 오류로 전체가 멈추지 않도록
+            print("분석 오류:", r["code"], e)
+            continue
+        if b is not None and res.get("rs_na") is None:
+            res["rs_bench"] = "KODEX 200" if mk != "KOSDAQ" else "KODEX 코스닥150"
+        for k, why in res["rejections"].items():
+            key = (k, MD.short_reason(why))
+            rej[key] = rej.get(key, 0) + 1
+        if res["models"]:
+            stocks.append(res)
+    order = MD.STATUS_ORDER
+    stocks.sort(key=lambda s: (order[s["models"][0]["status"]], -(s.get("best_score") or 0)))
+    return stocks, rej
+
+
+def write_model_csv(path, stocks):
+    """엑셀에서 바로 열 수 있는 CSV (UTF-8 BOM) - 종목×모델 한 줄씩"""
+    rows = []
+    for s in stocks:
+        for e in s["models"]:
+            rows.append({
+                "데이터기준일": s.get("asof"), "종목코드": s["code"], "종목명": s["name"], "진입모델": e["model_name"],
+                "상태": e["status"], "점수(0~100)": e.get("score"), "원점수": e.get("score_raw"), "만점": e.get("score_max"),
+                "현재가": s.get("close"), "피벗": e.get("pivot"), "피벗괴리율": e.get("dist"), "무효화가격": e.get("invalid"),
+                "무효화조건": e.get("invalid_rule"), "돌파거래량배수": e.get("brk_mult"), "RSI14": s.get("rsi"),
+                "ATR/종가": s.get("atrp"), "ATR방향": s.get("atrp_dir"), "거래량수축(5/20)": s.get("vol_dry"),
+                "MA50": s.get("ma50"), "MA150": s.get("ma150"), "MA200": s.get("ma200"),
+                "MA50기울기": s.get("ma50_slope"), "MA150기울기": s.get("ma150_slope"), "MA200기울기": s.get("ma200_slope"),
+                "지수대비3개월": s.get("rs_excess"), "RS선기울기": s.get("rs_slope"), "RS계산불가사유": s.get("rs_na"),
+                "상세": e.get("detail"), "통과사유": " / ".join(e.get("plus", [])), "감점사유": " / ".join(e.get("minus", [])),
+            })
+    pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
+
+
 # ───────────────────────── 메인 ─────────────────────────
 def main():
     t0 = time.time()
     now = datetime.now(KST)
     tv = stage1(clean_universe(fetch_tv()))
     cand = tv[tv["pass7"]].copy()
-    print(f"TradingView 조회 {len(tv)}종목 → 1단계 통과 {len(cand)}종목")
+    pre_mask, pre_drop = model_prefilter(tv)
+    pre = tv[pre_mask | tv["pass7"]].copy()
+    print(f"TradingView 조회 {len(tv)}종목 → 기존 1단계 통과 {len(cand)}종목 / 진입모델 사전 필터 통과 {len(pre)}종목")
 
-    start = (now - timedelta(days=420)).strftime("%Y-%m-%d")
+    start = (now - timedelta(days=MCFG["data"]["history_days"])).strftime("%Y-%m-%d")
     with ThreadPoolExecutor(max_workers=8) as ex:
-        hist = dict(ex.map(lambda c: fetch_hist(c, start), cand["code"].tolist()))
+        hist = dict(ex.map(lambda c: fetch_hist(c, start), pre["code"].tolist()))
+    bench, mkt = fetch_benchmarks(start)
 
     os.makedirs(os.path.join(OUT, "charts"), exist_ok=True)
     os.makedirs(os.path.join(OUT, "history"), exist_ok=True)
     rows, last_dates = [], []
     for _, r in cand.iterrows():
         d = hist.get(r["code"])
+        if d is not None:
+            d = d[d["Volume"] > 0]                         # 기존 VCP 경로: 거래량 0일 제거 (기존과 동일)
         if d is None or len(d) < CFG["min_bars"]:
             continue
         last_dates.append(d.index[-1])
@@ -215,8 +322,22 @@ def main():
             vol_today=num(v.get("당일거래량배수"), 2), note=v.get("비고", ""),
         ))
         with open(os.path.join(OUT, "charts", f"{r['code']}.json"), "w", encoding="utf-8") as f:
-            json.dump(chart_payload(d), f, separators=(",", ":"))
+            json.dump(chart_payload(d), f, separators=(",", ":"), default=_jsonable)
 
+    # ── 5대 진입모델 ──
+    mstocks, mrej = model_rows(pre, hist, bench, mkt)
+    for s in mstocks:
+        if s.get("asof"):
+            last_dates.append(pd.Timestamp(s["asof"]))
+        if any(e["status"] in (MD.SIGNAL, MD.FORM) for e in s["models"]) and hist.get(s["code"]) is not None:
+            d = hist[s["code"]]
+            with open(os.path.join(OUT, "charts", f"{s['code']}.json"), "w", encoding="utf-8") as f:
+                json.dump(chart_payload(d[d["Volume"] > 0]), f, separators=(",", ":"), default=_jsonable)
+    mcount = {}
+    for s in mstocks:
+        for e in s["models"]:
+            k = (e["model_name"], e["status"])
+            mcount[k] = mcount.get(k, 0) + 1
     asof = max(last_dates).strftime("%Y-%m-%d") if last_dates else now.strftime("%Y-%m-%d")
     order = {"돌파(거래량 동반)": 0}
     gorder = {"A": 0, "B": 1, "C": 2, "N/A": 3}
@@ -224,13 +345,21 @@ def main():
     result = dict(
         asof=asof, generated_at=now.strftime("%Y-%m-%d %H:%M KST"), source="TradingView screener + FinanceDataReader",
         settings=SETTINGS, market=market_condition(),
-        counts=dict(universe=int(len(tv)), stage1=int(len(cand)), trend=len(rows), vcp=sum(x["vcp"] for x in rows)),
+        counts=dict(universe=int(len(tv)), stage1=int(len(cand)), trend=len(rows), vcp=sum(x["vcp"] for x in rows),
+                    prefilter=int(len(pre))),
         stocks=rows,
+        models=mstocks,
+        model_counts=[dict(model=k[0], status=k[1], n=v) for k, v in sorted(mcount.items())],
+        drop_log=dict(prefilter=pre_drop,
+                      model=[dict(model=MCFG["models"][k]["name"], reason=w, n=n)
+                             for (k, w), n in sorted(mrej.items(), key=lambda x: -x[1])]),
+        model_note="점수 가중치·임계값은 검증되지 않은 초기값입니다 (screener/config.json).",
     )
+    write_model_csv(os.path.join(OUT, "models_latest.csv"), mstocks)
     with open(os.path.join(OUT, "latest.json"), "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=1)
+        json.dump(result, f, ensure_ascii=False, indent=1, default=_jsonable)
     with open(os.path.join(OUT, "history", f"{asof.replace('-', '')}.json"), "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, separators=(",", ":"))
+        json.dump(result, f, ensure_ascii=False, separators=(",", ":"), default=_jsonable)
 
     # 날짜별 기록 목록 정리
     hist_dir = os.path.join(OUT, "history")
@@ -239,10 +368,11 @@ def main():
         os.remove(os.path.join(hist_dir, old))
     files = files[-SETTINGS["keep_history"]:]
     with open(os.path.join(hist_dir, "index.json"), "w", encoding="utf-8") as f:
-        json.dump([x[:-5] for x in files], f)
+        json.dump([x[:-5] for x in files], f, default=_jsonable)
 
     # 오늘 목록에 없는 종목의 차트 파일 삭제
-    keep = {x["code"] for x in rows}
+    keep = {x["code"] for x in rows} | {s["code"] for s in mstocks
+                                        if any(e["status"] in (MD.SIGNAL, MD.FORM) for e in s["models"])}
     for fn in os.listdir(os.path.join(OUT, "charts")):
         if fn[:-5] not in keep:
             os.remove(os.path.join(OUT, "charts", fn))
@@ -251,10 +381,15 @@ def main():
     vcp_syms = [x["tv"] for x in rows if x["vcp"]]
     other = [x["tv"] for x in rows if not x["vcp"]]
     with open(os.path.join(OUT, "watchlist_tradingview.txt"), "w", encoding="utf-8") as f:
-        f.write(",".join((["###VCP후보"] + vcp_syms if vcp_syms else []) + ["###트렌드템플릿"] + other))
+        sig = [s["tv"] for s in mstocks if s["models"][0]["status"] == MD.SIGNAL]
+        form = [s["tv"] for s in mstocks if s["models"][0]["status"] == MD.FORM]
+        f.write(",".join((["###진입신호"] + sig if sig else []) + (["###패턴형성"] + form if form else [])
+                         + (["###VCP후보"] + vcp_syms if vcp_syms else []) + ["###트렌드템플릿"] + other))
 
     print(f"기준일 {asof}: 트렌드 템플릿 {len(rows)}개, VCP 후보 {result['counts']['vcp']}개 "
           f"({time.time() - t0:.0f}초)")
+    for (mn, st), n in sorted(mcount.items()):
+        print(f"  {mn:<16} {st:<10} {n}")
 
 
 if __name__ == "__main__":

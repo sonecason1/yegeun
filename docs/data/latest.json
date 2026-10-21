@@ -1,6 +1,6 @@
 {
  "asof": "2026-10-20",
- "generated_at": "2026-10-21 08:48 KST",
+ "generated_at": "2026-10-21 08:59 KST",
  "source": "TradingView screener + FinanceDataReader",
  "settings": {
   "min_marcap": 50000000000,
@@ -13,20 +13,20 @@
   {
    "name": "코스피200 (KODEX 200)",
    "close": 86755.0,
-   "ma50": 105153.3,
-   "ma200": 99510.07,
+   "ma50": 104802.4,
+   "ma200": 99653.9,
    "from_high": -0.414,
    "state": "혼조",
-   "date": "2026-10-20"
+   "date": "2026-10-21"
   },
   {
    "name": "코스닥150 (KODEX 코스닥150)",
    "close": 13115.0,
-   "ma50": 14162.9,
-   "ma200": 16779.03,
+   "ma50": 14154.3,
+   "ma200": 16767.38,
    "from_high": -0.3784,
    "state": "하락 추세",
-   "date": "2026-10-20"
+   "date": "2026-10-21"
   }
  ],
  "counts": {
